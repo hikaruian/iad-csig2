@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+import time
+
+from pathlib import Path
+
+import numpy as np
+
+
+def parse_args():
+
+    p = argparse.ArgumentParser()
+
+    p.add_argument(
+        "--train-root",
+        required=True,
+    )
+
+    p.add_argument(
+        "--save-root",
+        default="runs/final_cv",
+    )
+
+    p.add_argument(
+        "--folds",
+        type=int,
+        default=3,
+    )
+
+    p.add_argument(
+        "--holdout",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--max-epochs",
+        type=int,
+        default=100,
+    )
+
+    p.add_argument(
+        "--eval-every",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--encoder",
+        default="dinov2reg_vit_large_14",
+    )
+
+    p.add_argument(
+        "--nproc",
+        type=int,
+        default=2,
+    )
+
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+    )
+
+    p.add_argument(
+        "--grad-accum",
+        type=int,
+        default=8,
+    )
+
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+    )
+
+    # 11h30m by default.
+    p.add_argument(
+        "--job-seconds",
+        type=int,
+        default=41400,
+    )
+
+    p.add_argument(
+        "--sensitivity-retain",
+        type=float,
+        default=0.95,
+    )
+
+    return p.parse_args()
+
+
+def run(command):
+
+    print(
+        "\n[RUN] "
+        + " ".join(command),
+        flush=True,
+    )
+
+    subprocess.run(
+        command,
+        check=True,
+    )
+
+
+def categories(root):
+
+    return sorted(
+        p.name
+        for p in Path(root).iterdir()
+        if p.is_dir()
+    )
+
+
+def generate_folds(
+    cats,
+    folds,
+    holdout,
+    seed,
+):
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    order = list(cats)
+
+    rng.shuffle(order)
+
+    if (
+        folds * holdout
+        > len(order)
+    ):
+
+        raise ValueError(
+            "folds*holdout exceeds category count"
+        )
+
+    output = []
+
+    for fold in range(folds):
+
+        start = (
+            fold * holdout
+        )
+
+        held = sorted(
+            order[
+                start:
+                start + holdout
+            ]
+        )
+
+        held_set = set(held)
+
+        train = sorted(
+            x
+            for x in cats
+            if x not in held_set
+        )
+
+        output.append(
+            {
+                "fold": fold,
+                "train": train,
+                "holdout": held,
+            }
+        )
+
+    return output
+
+
+def checkpoint_epoch(path):
+
+    return int(
+        path.stem.split("_")[-1]
+    )
+
+
+def choose_checkpoint(
+    records,
+    retain,
+):
+    """
+    Pareto rule:
+
+    sensitivity =
+        separation * pixel_f1
+
+    First preserve >= 95% best synthetic sensitivity.
+
+    Then minimize:
+        |log(normal_gap)|
+
+    rather than simply normal_gap, because both
+    unseen >> seen and unseen << seen indicate
+    distribution mismatch.
+    """
+
+    for record in records:
+
+        record["sensitivity"] = (
+            record["separation"]
+            * record["pixel_f1"]
+        )
+
+        record["gap_penalty"] = abs(
+            np.log(
+                max(
+                    record["normal_gap"],
+                    1e-8,
+                )
+            )
+        )
+
+    best_sensitivity = max(
+        x["sensitivity"]
+        for x in records
+    )
+
+    minimum = (
+        retain
+        * best_sensitivity
+    )
+
+    candidates = [
+        x
+        for x in records
+        if x["sensitivity"]
+        >= minimum
+    ]
+
+    return min(
+        candidates,
+        key=lambda x:
+        (
+            x["gap_penalty"],
+            -x["sensitivity"],
+        ),
+    )
+
+
+def main():
+
+    args = parse_args()
+
+    start = time.time()
+
+    root = Path(
+        args.save_root
+    )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    cats = categories(
+        args.train_root
+    )
+
+    folds = generate_folds(
+        cats,
+        args.folds,
+        args.holdout,
+        args.seed,
+    )
+
+    folds_file = (
+        root / "folds.json"
+    )
+
+    if folds_file.exists():
+
+        existing = json.loads(
+            folds_file.read_text()
+        )
+
+        if existing != folds:
+
+            raise RuntimeError(
+                "Existing folds.json does not match "
+                "current settings."
+            )
+
+    else:
+
+        folds_file.write_text(
+            json.dumps(
+                folds,
+                indent=2,
+            )
+        )
+
+    # ========================================================
+    # CV
+    # ========================================================
+
+    for info in folds:
+
+        fold = info["fold"]
+
+        fold_dir = (
+            root
+            / f"fold_{fold}"
+        )
+
+        fold_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        train_file = (
+            fold_dir
+            / "train_categories.json"
+        )
+
+        holdout_file = (
+            fold_dir
+            / "holdout_categories.json"
+        )
+
+        train_file.write_text(
+            json.dumps(
+                info["train"],
+                indent=2,
+            )
+        )
+
+        holdout_file.write_text(
+            json.dumps(
+                info["holdout"],
+                indent=2,
+            )
+        )
+
+        model_dir = (
+            fold_dir
+            / "model"
+        )
+
+        final_checkpoint = (
+            model_dir
+            / (
+                f"epoch_"
+                f"{args.max_epochs:04d}.pth"
+            )
+        )
+
+        # ----------------------------------------------------
+        # Train/resume fold
+        # ----------------------------------------------------
+
+        if not final_checkpoint.is_file():
+
+            remaining = (
+                args.job_seconds
+                - (
+                    time.time()
+                    - start
+                )
+            )
+
+            if remaining < 600:
+
+                print(
+                    "[safe-exit] insufficient job time"
+                )
+
+                return
+
+            run([
+                "torchrun",
+                "--standalone",
+                (
+                    "--nproc_per_node="
+                    f"{args.nproc}"
+                ),
+                "train.py",
+                "--train-root",
+                args.train_root,
+                "--save-dir",
+                str(model_dir),
+                "--category-file",
+                str(train_file),
+                "--encoder",
+                args.encoder,
+                "--epochs",
+                str(args.max_epochs),
+                "--save-every",
+                str(args.eval_every),
+                "--batch-size",
+                str(args.batch_size),
+                "--grad-accum",
+                str(args.grad_accum),
+                "--job-seconds",
+                str(
+                    max(
+                        300,
+                        int(
+                            remaining
+                            - 300
+                        ),
+                    )
+                ),
+                "--amp",
+            ])
+
+        # ----------------------------------------------------
+        # Evaluate available checkpoints
+        # ----------------------------------------------------
+
+        checkpoints = sorted(
+            model_dir.glob(
+                "epoch_*.pth"
+            )
+        )
+
+        for checkpoint in checkpoints:
+
+            epoch = checkpoint_epoch(
+                checkpoint
+            )
+
+            metrics_file = (
+                fold_dir
+                / (
+                    f"proxy_"
+                    f"{epoch:04d}.json"
+                )
+            )
+
+            if metrics_file.is_file():
+                continue
+
+            if (
+                time.time()
+                - start
+                > args.job_seconds
+                - 600
+            ):
+
+                print(
+                    "[safe-exit] "
+                    "resume same command later"
+                )
+
+                return
+
+            run([
+                sys.executable,
+                "proxy_eval.py",
+                "--root",
+                args.train_root,
+                "--ckpt",
+                str(checkpoint),
+                "--train-category-file",
+                str(train_file),
+                "--holdout-category-file",
+                str(holdout_file),
+                "--output-json",
+                str(metrics_file),
+            ])
+
+        # Fold will be completed on the next invocation
+        # if training stopped due to deadline.
+
+    # ========================================================
+    # Ensure all folds reached target epoch
+    # ========================================================
+
+    for info in folds:
+
+        final_checkpoint = (
+            root
+            / f"fold_{info['fold']}"
+            / "model"
+            / (
+                f"epoch_"
+                f"{args.max_epochs:04d}.pth"
+            )
+        )
+
+        if not final_checkpoint.is_file():
+
+            print(
+                "[cv] not all folds complete; "
+                "rerun identical command"
+            )
+
+            return
+
+    # ========================================================
+    # Select epochs
+    # ========================================================
+
+    best_epochs = []
+
+    fold_results = []
+
+    for info in folds:
+
+        fold_dir = (
+            root
+            / f"fold_{info['fold']}"
+        )
+
+        records = []
+
+        for file in sorted(
+            fold_dir.glob(
+                "proxy_*.json"
+            )
+        ):
+
+            metrics = json.loads(
+                file.read_text()
+            )
+
+            metrics["epoch"] = int(
+                file.stem.split("_")[-1]
+            )
+
+            records.append(
+                metrics
+            )
+
+        if not records:
+
+            raise RuntimeError(
+                f"No proxy records for "
+                f"fold {info['fold']}"
+            )
+
+        best = choose_checkpoint(
+            records,
+            args.sensitivity_retain,
+        )
+
+        best_epochs.append(
+            best["epoch"]
+        )
+
+        fold_results.append({
+            "fold":
+                info["fold"],
+
+            "best":
+                best,
+
+            "records":
+                records,
+        })
+
+        print(
+            f"[fold {info['fold']}] "
+            f"best epoch={best['epoch']} "
+            f"gap={best['normal_gap']:.4f} "
+            f"sensitivity="
+            f"{best['sensitivity']:.4f}"
+        )
+
+    final_epoch = int(
+        statistics.median(
+            best_epochs
+        )
+    )
+
+    summary = {
+        "best_epochs":
+            best_epochs,
+
+        "final_epoch":
+            final_epoch,
+
+        "fold_results":
+            fold_results,
+    }
+
+    (
+        root
+        / "cv_summary.json"
+    ).write_text(
+        json.dumps(
+            summary,
+            indent=2,
+        )
+    )
+
+    print(
+        "[cv] best epochs:",
+        best_epochs,
+    )
+
+    print(
+        "[cv] final epoch:",
+        final_epoch,
+    )
+
+    # ========================================================
+    # Final Train50
+    # ========================================================
+
+    final_dir = (
+        root
+        / "final"
+    )
+
+    target = (
+        final_dir
+        / (
+            f"epoch_"
+            f"{final_epoch:04d}.pth"
+        )
+    )
+
+    if target.is_file():
+
+        print(
+            "[DONE]",
+            target,
+        )
+
+        return
+
+    remaining = (
+        args.job_seconds
+        - (
+            time.time()
+            - start
+        )
+    )
+
+    if remaining < 600:
+
+        print(
+            "[safe-exit] CV complete; "
+            "rerun to continue final training"
+        )
+
+        return
+
+    run([
+        "torchrun",
+        "--standalone",
+        (
+            "--nproc_per_node="
+            f"{args.nproc}"
+        ),
+        "train.py",
+        "--train-root",
+        args.train_root,
+        "--save-dir",
+        str(final_dir),
+        "--encoder",
+        args.encoder,
+        "--epochs",
+        str(final_epoch),
+        "--save-every",
+        str(final_epoch),
+        "--batch-size",
+        str(args.batch_size),
+        "--grad-accum",
+        str(args.grad_accum),
+        "--job-seconds",
+        str(
+            max(
+                300,
+                int(
+                    remaining
+                    - 300
+                ),
+            )
+        ),
+        "--amp",
+    ])
+
+    if target.is_file():
+
+        print()
+        print(
+            "FINAL MODEL:",
+            target,
+        )
+
+    else:
+
+        print(
+            "[safe-exit] final training incomplete; "
+            "rerun identical command"
+        )
+
+
+if __name__ == "__main__":
+    main()

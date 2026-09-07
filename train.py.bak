@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from contextlib import nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from torch.nn.parallel import (
+    DistributedDataParallel as DDP,
+)
+
+from torch.utils.data import (
+    DataLoader,
+    DistributedSampler,
+)
+
+from tqdm import tqdm
+
+from src.data import CSIGImageDataset
+
+from src.dist_utils import (
+    barrier,
+    cleanup,
+    init_distributed,
+    is_main,
+    make_autocast,
+    make_scaler,
+    reduce_mean,
+    setup_seed,
+    unwrap,
+)
+
+from src.encoder import (
+    prefetch_encoder_weights,
+)
+
+from src.losses import (
+    pixel_loss,
+    total_loss,
+)
+
+from src.model import build_model
+
+from src.optim import (
+    StableAdamW,
+    WarmCosineScheduler,
+)
+
+
+def parse_args():
+
+    p = argparse.ArgumentParser()
+
+    p.add_argument(
+        "--train-root",
+        required=True,
+    )
+
+    p.add_argument(
+        "--save-dir",
+        required=True,
+    )
+
+    p.add_argument(
+        "--category-file",
+        default="",
+    )
+
+    p.add_argument(
+        "--encoder",
+        default="dinov2reg_vit_large_14",
+    )
+
+    p.add_argument(
+        "--encoder-source",
+        default="auto",
+    )
+
+    p.add_argument(
+        "--image-size",
+        type=int,
+        default=448,
+    )
+
+    p.add_argument(
+        "--inp-num",
+        type=int,
+        default=12,
+    )
+
+    p.add_argument(
+        "--decoder-depth",
+        type=int,
+        default=8,
+    )
+
+    p.add_argument(
+        "--residual-strength",
+        type=float,
+        default=0.20,
+    )
+
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+    )
+
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+    )
+
+    p.add_argument(
+        "--grad-accum",
+        type=int,
+        default=8,
+    )
+
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=5e-4,
+    )
+
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=1e-6,
+    )
+
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-5,
+    )
+
+    p.add_argument(
+        "--gather-weight",
+        type=float,
+        default=0.1,
+    )
+
+    p.add_argument(
+        "--soft-y",
+        type=float,
+        default=2.0,
+    )
+
+    p.add_argument(
+        "--synthetic-prob",
+        type=float,
+        default=0.8,
+    )
+
+    p.add_argument(
+        "--pixel-warmup",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+    )
+
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+    )
+
+    p.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    # Stop cleanly before platform's 12h SIGKILL.
+    # 0 = unlimited.
+    p.add_argument(
+        "--job-seconds",
+        type=int,
+        default=0,
+    )
+
+    return p.parse_args()
+
+
+def atomic_save(
+    state,
+    path,
+):
+
+    path = Path(path)
+
+    tmp = Path(
+        str(path)
+        + ".tmp"
+    )
+
+    torch.save(
+        state,
+        tmp,
+    )
+
+    os.replace(
+        tmp,
+        path,
+    )
+
+
+def main():
+
+    args = parse_args()
+
+    job_start = time.time()
+
+    prefetch_encoder_weights(
+        args.encoder,
+        args.encoder_source,
+        str(
+            Path(args.save_dir)
+            / "_prefetch"
+        ),
+    )
+
+    info = init_distributed()
+
+    setup_seed(
+        args.seed,
+        rank=info.rank,
+    )
+
+    device = info.device
+
+    save_dir = Path(
+        args.save_dir
+    )
+
+    if is_main(info):
+        save_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    barrier()
+
+    include = None
+
+    if args.category_file:
+
+        include = set(
+            json.loads(
+                Path(
+                    args.category_file
+                ).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+
+    dataset = CSIGImageDataset(
+        args.train_root,
+        image_size=args.image_size,
+        synthetic_anomaly=True,
+        synthetic_prob=args.synthetic_prob,
+        include_categories=include,
+    )
+
+    sampler = (
+        DistributedSampler(
+            dataset,
+            shuffle=True,
+            drop_last=True,
+        )
+        if info.distributed
+        else None
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        num_workers=args.num_workers,
+        pin_memory=(
+            device.type == "cuda"
+        ),
+        drop_last=True,
+        persistent_workers=(
+            args.num_workers > 0
+        ),
+    )
+
+    if not len(loader):
+        raise RuntimeError(
+            "Empty DataLoader"
+        )
+
+    model = build_model(
+        encoder_name=args.encoder,
+        inp_num=args.inp_num,
+        decoder_depth=args.decoder_depth,
+        residual_strength=(
+            args.residual_strength
+        ),
+        encoder_source=args.encoder_source,
+    ).to(device)
+
+    raw = model
+
+    parameters = list(
+        raw.trainable_parameters()
+    )
+
+    accumulation = max(
+        1,
+        args.grad_accum,
+    )
+
+    optimizer_steps = (
+        len(loader)
+        + accumulation
+        - 1
+    ) // accumulation
+
+    optimizer = StableAdamW(
+        [{"params": parameters}],
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+        amsgrad=True,
+        eps=1e-10,
+    )
+
+    scheduler = WarmCosineScheduler(
+        optimizer,
+        base_value=args.lr,
+        final_value=args.min_lr,
+        total_iters=(
+            args.epochs
+            * optimizer_steps
+        ),
+        warmup_iters=min(
+            100,
+            max(
+                10,
+                optimizer_steps,
+            ),
+        ),
+    )
+
+    scaler = make_scaler(
+        args.amp
+    )
+
+    start_epoch = 0
+
+    last_path = (
+        save_dir / "last.pth"
+    )
+
+    # --------------------------------------------------------
+    # Automatic resume BEFORE DDP wrapping.
+    # --------------------------------------------------------
+
+    if last_path.is_file():
+
+        checkpoint = torch.load(
+            last_path,
+            map_location="cpu",
+        )
+
+        raw.load_state_dict(
+            checkpoint["model"],
+            strict=True,
+        )
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer"]
+        )
+
+        if (
+            "scheduler"
+            in checkpoint
+        ):
+
+            scheduler.load_state_dict(
+                checkpoint[
+                    "scheduler"
+                ]
+            )
+
+        if (
+            "scaler"
+            in checkpoint
+        ):
+
+            scaler.load_state_dict(
+                checkpoint[
+                    "scaler"
+                ]
+            )
+
+        start_epoch = int(
+            checkpoint["epoch"]
+        )
+
+        if is_main(info):
+            print(
+                f"[resume] epoch "
+                f"{start_epoch}"
+            )
+
+    if info.distributed:
+
+        model = DDP(
+            model,
+            device_ids=[
+                info.local_rank
+            ],
+            output_device=info.local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
+
+    raw = unwrap(
+        model
+    )
+
+    if start_epoch >= args.epochs:
+
+        if is_main(info):
+            print(
+                "[done] already completed"
+            )
+
+        return
+
+    for epoch in range(
+        start_epoch,
+        args.epochs,
+    ):
+
+        model.train()
+        raw.encoder.eval()
+
+        if sampler:
+            sampler.set_epoch(epoch)
+
+        pixel_weight = min(
+            1.0,
+            (epoch + 1)
+            / max(
+                1,
+                args.pixel_warmup,
+            ),
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        running = []
+
+        iterator = (
+            tqdm(
+                loader,
+                desc=(
+                    f"{epoch+1}/"
+                    f"{args.epochs}"
+                ),
+            )
+            if is_main(info)
+            else loader
+        )
+
+        for step, batch in enumerate(
+            iterator
+        ):
+
+            clean = (
+                batch["clean"]
+                .to(
+                    device,
+                    non_blocking=True,
+                )
+            )
+
+            synthetic = (
+                batch["synthetic"]
+                .to(
+                    device,
+                    non_blocking=True,
+                )
+            )
+
+            mask = (
+                batch["mask"]
+                .to(
+                    device,
+                    non_blocking=True,
+                )
+            )
+
+            do_step = (
+                (step + 1)
+                % accumulation
+                == 0
+                or step + 1
+                == len(loader)
+            )
+
+            sync = (
+                model.no_sync()
+                if (
+                    info.distributed
+                    and not do_step
+                )
+                else nullcontext()
+            )
+
+            with sync:
+
+                with make_autocast(
+                    args.amp
+                ):
+
+                    clean_output = model(
+                        clean,
+                        return_maps=True,
+                    )
+
+                    loss_clean = total_loss(
+                        clean_output["en"],
+                        clean_output["de"],
+                        clean_output["g_loss"],
+                        gather_weight=(
+                            args.gather_weight
+                        ),
+                        y=args.soft_y,
+                    )
+
+                scaler.scale(
+                    loss_clean
+                    / accumulation
+                ).backward()
+
+                with make_autocast(
+                    args.amp
+                ):
+
+                    syn_output = model(
+                        synthetic,
+                        return_maps=True,
+                    )
+
+                    ploss = pixel_loss(
+                        syn_output[
+                            "pixel_map"
+                        ],
+                        syn_output[
+                            "pixel_delta"
+                        ],
+                        mask,
+                    )
+
+                    loss_pixel = (
+                        pixel_weight
+                        * ploss["total"]
+                    )
+
+                scaler.scale(
+                    loss_pixel
+                    / accumulation
+                ).backward()
+
+            if do_step:
+
+                scaler.unscale_(
+                    optimizer
+                )
+
+                nn.utils.clip_grad_norm_(
+                    parameters,
+                    0.5,
+                )
+
+                scaler.step(
+                    optimizer
+                )
+
+                scaler.update()
+
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+                scheduler.step()
+
+            reduced = reduce_mean(
+                loss_clean.detach()
+                + loss_pixel.detach()
+            )
+
+            running.append(
+                float(
+                    reduced.cpu()
+                )
+            )
+
+        mean_loss = float(
+            np.mean(running)
+        )
+
+        if is_main(info):
+
+            state = {
+                "epoch":
+                    epoch + 1,
+
+                "model":
+                    raw.state_dict(),
+
+                "optimizer":
+                    optimizer.state_dict(),
+
+                "scheduler":
+                    scheduler.state_dict(),
+
+                "scaler":
+                    scaler.state_dict(),
+
+                "args":
+                    vars(args),
+
+                "loss":
+                    mean_loss,
+            }
+
+            atomic_save(
+                state,
+                last_path,
+            )
+
+            if (
+                (epoch + 1)
+                % args.save_every
+                == 0
+                or epoch + 1
+                == args.epochs
+            ):
+
+                atomic_save(
+                    state,
+                    save_dir
+                    / (
+                        f"epoch_"
+                        f"{epoch+1:04d}.pth"
+                    ),
+                )
+
+        barrier()
+
+        # ----------------------------------------------------
+        # Safe exit at epoch boundary.
+        # ----------------------------------------------------
+
+        if (
+            args.job_seconds > 0
+        ):
+
+            elapsed = (
+                time.time()
+                - job_start
+            )
+
+            stop = torch.tensor(
+                int(
+                    elapsed
+                    >= args.job_seconds
+                ),
+                device=device,
+            )
+
+            if info.distributed:
+
+                torch.distributed.all_reduce(
+                    stop,
+                    op=(
+                        torch.distributed
+                        .ReduceOp.MAX
+                    ),
+                )
+
+            if stop.item():
+
+                if is_main(info):
+                    print(
+                        "[safe-exit] "
+                        f"epoch={epoch+1}"
+                    )
+
+                break
+
+
+if __name__ == "__main__":
+
+    os.environ.setdefault(
+        "NCCL_P2P_DISABLE",
+        "1",
+    )
+
+    os.environ.setdefault(
+        "NCCL_IB_DISABLE",
+        "1",
+    )
+
+    try:
+        main()
+    finally:
+        cleanup()
