@@ -361,7 +361,7 @@ def collect_clean(
 
     scores = []
 
-    for images, _ in loader:
+    for images, _ in tqdm(loader):
 
         images = images.to(
             device,
