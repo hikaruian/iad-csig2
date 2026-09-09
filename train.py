@@ -1193,7 +1193,7 @@ def main():
                 info.local_rank
             ),
             broadcast_buffers=False,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
         )
 
     raw = unwrap(
