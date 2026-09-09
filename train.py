@@ -417,7 +417,7 @@ def collect_synthetic(
         dtype=torch.float32,
     )
 
-    for batch in loader:
+    for batch in tqdm(loader):
 
         images = (
             batch[
