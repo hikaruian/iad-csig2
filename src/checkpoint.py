@@ -7,7 +7,8 @@ from typing import Any, Dict, Tuple
 import torch
 
 from .dist_utils import strip_module_prefix
-from .model import INPFormer, TRAINABLE_PREFIXES, build_model  # INPFormer used in return type
+#from .model import INPFormer, TRAINABLE_PREFIXES, build_model  # INPFormer used in return type
+from .model import INPFormer, build_model  # INPFormer used in return type
 
 
 def torch_load(path: str, map_location="cpu"):
