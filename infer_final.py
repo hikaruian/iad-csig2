@@ -202,7 +202,7 @@ def load_model(
         ),
         encoder_source=cfg.get(
             "encoder_source",
-            "auto",
+            "timm",
         ),
     ).to(device)
 
