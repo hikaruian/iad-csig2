@@ -105,7 +105,7 @@ def parse_args():
 
     p.add_argument(
         "--encoder-source",
-        default="auto",
+        default="timm",
     )
 
     p.add_argument(
