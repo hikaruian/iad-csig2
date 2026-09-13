@@ -160,6 +160,7 @@ class DinoV2Encoder(nn.Module):
                     self.backend = "hub"
                     return model
 
+                """
                 import timm
 
                 model = timm.create_model(
@@ -171,6 +172,7 @@ class DinoV2Encoder(nn.Module):
 
                 self.backend = "timm"
                 return model
+                """
 
             except Exception as exc:
                 errors.append(
